@@ -202,44 +202,190 @@ table{width:100%;border-collapse:separate;border-spacing:0;overflow:hidden;borde
   <div class="footer">※ 엑셀 첫 줄에 제목이 있어도 자동으로 ‘차트번호, 수진자명, 주민등록번호, 내원일’이 있는 행을 찾아 분석합니다.</div>
 </div>
 <script>
-const state={total:[],inj:[],manual:[],shock:[],dateRows:[],patientRows:[],selectedDateCombo:null,selectedPatientCombo:null,lastDateList:[],lastPatientList:[]};
+const state={total:[],inj:[],manual:[],shock:[],dateRows:[],patientRows:[],selectedDateCombo:null,selectedPatientCombo:null,lastDateList:[],lastPatientList:[],formats:{total:new Set(),inj:new Set(),manual:new Set(),shock:new Set()}};
 const combos=['주사치료','도수치료','체외충격파','주사치료 + 도수치료','주사치료 + 체외충격파','도수치료 + 체외충격파','주사치료 + 도수치료 + 체외충격파','그 외 치료'];
 const typeLabel={inj:'주사치료',manual:'도수치료',shock:'체외충격파'};
 function norm(v){return (v===undefined||v===null)?'':String(v).trim();}
+function cleanHeader(v){return norm(v).replace(/\s/g,'').replace(/[()（）\[\]▶◀]/g,'').toLowerCase();}
+function cleanChart(v){
+  let s=norm(v);
+  if(/^\d+(\.0+)?$/.test(s)) s=String(parseInt(s,10));
+  return s;
+}
 function excelDateToISO(v){
-  if(v instanceof Date && !isNaN(v)) return v.toISOString().slice(0,10);
-  if(typeof v==='number'){const d=XLSX.SSF.parse_date_code(v); if(d) return `${d.y}-${String(d.m).padStart(2,'0')}-${String(d.d).padStart(2,'0')}`;}
-  let s=norm(v).replace(/[.\/]/g,'-').replace(/\s+.*/,'');
-  const m=s.match(/(20\d{2}|19\d{2})-(\d{1,2})-(\d{1,2})/); if(m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+  if(v instanceof Date && !isNaN(v)){
+    const y=v.getFullYear(), m=String(v.getMonth()+1).padStart(2,'0'), d=String(v.getDate()).padStart(2,'0');
+    return `${y}-${m}-${d}`;
+  }
+  if(typeof v==='number'){
+    // Excel serial date first. BIFF(.xls) 처방일자/내원일이 숫자 시리얼로 들어오는 경우 대응
+    const d=XLSX.SSF.parse_date_code(v);
+    if(d && d.y>=1900 && d.y<=2100) return `${d.y}-${String(d.m).padStart(2,'0')}-${String(d.d).padStart(2,'0')}`;
+    const s=String(Math.trunc(Number(v))).padStart(8,'0');
+    if(/^(19|20)\d{6}/.test(s)) return `${s.slice(0,4)}-${s.slice(4,6)}-${s.slice(6,8)}`;
+  }
+  let raw=norm(v).replace(/[\u00a0\u3000]/g,' ');
+  let m=raw.match(/(20\d{2}|19\d{2})[-.\/년\s]*(\d{1,2})[-.\/월\s]*(\d{1,2})/);
+  if(m) return `${m[1]}-${m[2].padStart(2,'0')}-${m[3].padStart(2,'0')}`;
+  m=raw.match(/^(20\d{2}|19\d{2})(\d{2})(\d{2})/);
+  if(m) return `${m[1]}-${m[2]}-${m[3]}`;
+  const d=new Date(raw);
+  if(!isNaN(d) && d.getFullYear()>=1900) return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
   return '';
 }
-function findHeader(rows){
-  for(let i=0;i<Math.min(rows.length,30);i++){const vals=rows[i].map(norm); if(vals.includes('차트번호') && vals.includes('수진자명') && vals.includes('내원일')) return i;} return 0;
+function looksLikeHeader(vals){
+  const h=vals.map(cleanHeader);
+  const hasChart=h.some(x=>['차트번호','챠트번호','chartno','chart','등록번호','환자번호'].includes(x));
+  const hasName=h.some(x=>['수진자명','환자명','성명','이름','고객명','고객성명','환자성명'].includes(x));
+  const hasDate=h.some(x=>['내원일','진료일','일자','처방일','처방일자','시행일','시행일자','접수일','접수일자','예약일'].includes(x));
+  return hasChart && hasName && hasDate;
 }
-function colIndex(headers, names){for(const n of names){const idx=headers.findIndex(h=>norm(h).replace(/\s/g,'')===n.replace(/\s/g,'')); if(idx>=0) return idx;} return -1;}
+function findHeader(rows){
+  for(let i=0;i<Math.min(rows.length,60);i++){
+    const vals=rows[i].map(norm);
+    if(looksLikeHeader(vals)) return i;
+  }
+  return 0;
+}
+function colIndex(headers, names){
+  const hs=headers.map(cleanHeader);
+  for(const n of names){
+    const key=cleanHeader(n);
+    let idx=hs.findIndex(h=>h===key);
+    if(idx>=0) return idx;
+    idx=hs.findIndex(h=>h.includes(key)||key.includes(h));
+    if(idx>=0) return idx;
+  }
+  return -1;
+}
+function detectFormat(headers, hi){
+  const hs=headers.map(cleanHeader).join('|');
+  if(hs.includes('처방코드') && hs.includes('처방명칭') && hs.includes('처방일자')) return '비트 처방내역';
+  if(hi>0 || hs.includes('s/a') || hs.includes('초/재') || hs.includes('작업일') || hs.includes('접수메모')) return '비트 내원';
+  return '의사랑·비트';
+}
+function safeCell(row,c){
+  if(!row || c<0 || c>=row.length) return '';
+  const v=row[c];
+  return (v===undefined||v===null)?'':String(v).trim();
+}
+function makeAOA(sh, rawFlag){
+  return XLSX.utils.sheet_to_json(sh,{header:1, defval:'', raw:rawFlag, blankrows:false});
+}
+function sheetPacks(wb){
+  const packs=[];
+  for(const sn of wb.SheetNames){
+    const sh=wb.Sheets[sn];
+    if(!sh || !sh['!ref']) continue;
+    const aoaText=makeAOA(sh,false);
+    const aoaRaw=makeAOA(sh,true);
+    if(!aoaText.length) continue;
+    const scan=aoaText.slice(0,80).map(r=>r.map(norm));
+    const hi=findHeader(scan);
+    const headers=(aoaText[hi]||[]).map(norm);
+    packs.push({sn,sh,hi,headers,aoaText,aoaRaw});
+  }
+  return packs;
+}
+function readWorkbookFromBuffer(buf, lower){
+  const tries=[];
+  // BIFF(.xls), OOXML(.xlsx) 모두 대응. codepage 옵션은 구형 비트 xls의 한글/표시값 인식을 보강합니다.
+  tries.push(()=>XLSX.read(buf,{type:'array',cellDates:true,cellNF:true,cellText:true,codepage:949}));
+  tries.push(()=>XLSX.read(buf,{type:'array',cellDates:false,cellNF:true,cellText:true,codepage:949}));
+  if(lower.endsWith('.xls')){
+    const bytes=new Uint8Array(buf); let bin=''; const chunk=8192;
+    for(let i=0;i<bytes.length;i+=chunk) bin+=String.fromCharCode.apply(null, bytes.subarray(i,i+chunk));
+    tries.push(()=>XLSX.read(bin,{type:'binary',cellDates:true,cellNF:true,cellText:true,codepage:949}));
+    tries.push(()=>XLSX.read(bin,{type:'binary',cellDates:false,cellNF:true,cellText:true,codepage:949}));
+  }
+  let lastErr=null;
+  for(const t of tries){try{return t();}catch(e){lastErr=e;}}
+  throw lastErr || new Error('엑셀 파일을 읽지 못했습니다.');
+}
 async function parseFiles(files, kind){
-  let out=[];
+  let out=[]; const formats=new Set(); const debug=[];
   for(const file of files){
     const buf=await file.arrayBuffer(); let wb;
-    if(file.name.toLowerCase().endsWith('.csv')){const txt=new TextDecoder('euc-kr').decode(buf); wb=XLSX.read(txt,{type:'string'});} else wb=XLSX.read(buf,{type:'array',cellDates:true});
-    for(const sn of wb.SheetNames){
-      const rows=XLSX.utils.sheet_to_json(wb.Sheets[sn],{header:1,defval:''}); if(!rows.length) continue;
-      const hi=findHeader(rows); const headers=rows[hi].map(norm);
-      const cChart=colIndex(headers,['차트번호','챠트번호','chart']); const cName=colIndex(headers,['수진자명','환자명','성명','이름']); const cRrn=colIndex(headers,['주민등록번호','주민번호','등록번호']); const cDate=colIndex(headers,['내원일','진료일','일자','처방일']);
-      if(cChart<0||cName<0||cDate<0) continue;
-      for(let r=hi+1;r<rows.length;r++){
-        const row=rows[r]; const date=excelDateToISO(row[cDate]); const chart=norm(row[cChart]); const name=norm(row[cName]); const rrn=cRrn>=0?norm(row[cRrn]):'';
-        if(!date||!chart||!name) continue;
-        const pkey=`${chart}|${name}|${rrn}`; const dkey=`${pkey}|${date}`;
-        out.push({kind,chart,name,rrn,date,month:date.slice(0,7),pkey,dkey,source:file.name});
+    const lower=file.name.toLowerCase();
+    try{
+      if(lower.endsWith('.csv')){
+        let txt;
+        try{txt=new TextDecoder('utf-8').decode(buf);}catch(e){txt=new TextDecoder('euc-kr').decode(buf);}
+        wb=XLSX.read(txt,{type:'string',cellDates:true,codepage:949});
+      }else{
+        wb=readWorkbookFromBuffer(buf, lower);
       }
+    }catch(e){
+      console.error(e); debug.push(`${file.name}: 파일 읽기 실패`); continue;
+    }
+    for(const pack of sheetPacks(wb)){
+      const {sn,hi,headers,aoaText,aoaRaw}=pack;
+      const fmt=detectFormat(headers,hi); formats.add(fmt);
+      let cChart=colIndex(headers,['차트번호','챠트번호','chart','chart no','등록번호','환자번호']);
+      let cName=colIndex(headers,['수진자명','환자명','성명','이름','고객명','고객성명','환자성명']);
+      let cRrn=colIndex(headers,['주민등록번호','주민번호','주민번호앞자리','생년월일','등록번호2']);
+      let cDate=colIndex(headers,['내원일','진료일','처방일자','처방일','시행일자','시행일','접수일자','접수일','예약일','일자']);
+      const hs=headers.map(cleanHeader);
+      // 비트 처방내역: 실제 샘플 기준 A:처방코드, D:차트번호, E:성명, M:처방일자, N:주민번호
+      if(hs.includes('처방코드') && hs.includes('처방명칭')){
+        cChart=hs.indexOf('차트번호')>=0?hs.indexOf('차트번호'):3;
+        cName=hs.indexOf('성명')>=0?hs.indexOf('성명'):4;
+        cDate=hs.indexOf('처방일자')>=0?hs.indexOf('처방일자'):12;
+        cRrn=hs.indexOf('주민번호')>=0?hs.indexOf('주민번호'):13;
+      }
+      if(cChart<0||cName<0||cDate<0){
+        debug.push(`${file.name}/${sn}: 필수 컬럼 미인식`); continue;
+      }
+      let added=0, skipped=0, sampleSkip=[];
+      for(let r=hi+1;r<aoaText.length;r++){
+        const rowT=aoaText[r]||[], rowR=aoaRaw[r]||[];
+        const first=safeCell(rowT,0);
+        // 비트 파일 중간 구분행(◀ 과 목 ▶ 등)은 제외
+        if(first.includes('◀') || first.includes('▶')) {skipped++; continue;}
+        const rawDate=safeCell(rowR,cDate);
+        const txtDate=safeCell(rowT,cDate);
+        let date=excelDateToISO(rawDate) || excelDateToISO(txtDate);
+        const chart=cleanChart(safeCell(rowT,cChart) || safeCell(rowR,cChart));
+        const name=norm(safeCell(rowT,cName) || safeCell(rowR,cName));
+        const rrn=cRrn>=0?norm(safeCell(rowT,cRrn) || safeCell(rowR,cRrn)):'';
+        if(!date||!chart||!name){
+          skipped++;
+          if(sampleSkip.length<3 && (chart||name||txtDate||rawDate)) sampleSkip.push(`행${r+1}: chart=${chart||'-'}, name=${name||'-'}, date=${txtDate||rawDate||'-'}`);
+          continue;
+        }
+        const pkey=rrn ? `${chart}|${name}|${rrn}` : `${chart}|${name}`;
+        const dkey=`${pkey}|${date}`;
+        out.push({kind,chart,name,rrn,date,month:date.slice(0,7),pkey,dkey,source:file.name,format:fmt});
+        added++;
+      }
+      debug.push(`${file.name}/${sn}: ${added.toLocaleString()}건 인식${skipped?` / 제외 ${skipped.toLocaleString()}행`:''}${sampleSkip.length?` / 제외예시 ${sampleSkip.join(' ; ')}`:''}`);
     }
   }
-  const map=new Map(); out.forEach(x=>{if(!map.has(x.dkey)) map.set(x.dkey,x)}); return [...map.values()];
+  const map=new Map();
+  out.forEach(x=>{ if(!map.has(x.dkey)) map.set(x.dkey,x); });
+  state.formats[kind]=formats;
+  state[`debug_${kind}`]=debug;
+  return [...map.values()];
 }
-async function handle(id,key,countId){const files=document.getElementById(id).files; state[key]=await parseFiles(files,key); document.getElementById(countId).textContent=`파일 ${files.length}개 · 중복정리 후 ${state[key].length.toLocaleString()}건`; autoDates();}
-function autoDates(){const dates=state.total.map(x=>x.date).sort(); if(dates.length){if(!startDate.value) startDate.value=dates[0]; if(!endDate.value) endDate.value=dates[dates.length-1];}}
-['total','inj','manual','shock'].forEach((k,i)=>{const ids=['file-total','file-inj','file-manual','file-shock']; const cnt=['count-total','count-inj','count-manual','count-shock']; document.getElementById(ids[i]).addEventListener('change',()=>handle(ids[i],k,cnt[i]));});
+async function handle(id,key,countId){
+  const files=document.getElementById(id).files;
+  state[key]=await parseFiles(files,key);
+  const fmt=[...state.formats[key]].join('·') || '자동인식';
+  document.getElementById(countId).textContent=`파일 ${files.length}개 · ${fmt} 양식 · 동일환자+동일날짜 중복정리 후 ${state[key].length.toLocaleString()}건`;
+  autoDates();
+}
+function autoDates(){
+  const dates=state.total.map(x=>x.date).sort();
+  if(dates.length){
+    if(!startDate.value) startDate.value=dates[0];
+    if(!endDate.value) endDate.value=dates[dates.length-1];
+  }
+}
+['total','inj','manual','shock'].forEach((k,i)=>{
+  const ids=['file-total','file-inj','file-manual','file-shock'];
+  const cnt=['count-total','count-inj','count-manual','count-shock'];
+  document.getElementById(ids[i]).addEventListener('change',()=>handle(ids[i],k,cnt[i]));
+});
 function inRange(x){const s=startDate.value||'0000-00-00', e=endDate.value||'9999-99-99'; return x.date>=s && x.date<=e;}
 function comboName(flags){const a=[]; if(flags.inj)a.push('주사치료'); if(flags.manual)a.push('도수치료'); if(flags.shock)a.push('체외충격파'); return a.length?a.join(' + '):'그 외 치료';}
 function build(){
@@ -261,7 +407,7 @@ function renderSummary(){const d=state.dateRows,p=state.patientRows; const treat
 function renderMonths(){const months=[...new Set(state.dateRows.map(x=>x.month))].sort(); monthSummary.innerHTML=months.map(m=>{const dr=state.dateRows.filter(x=>x.month===m); const pkeys=new Set(dr.map(x=>x.pkey)); const pr=state.patientRows.filter(p=>pkeys.has(p.pkey)); const topD=countBy(dr).filter(x=>x.count).map(x=>`${x.combo} ${x.count}건(${x.rate.toFixed(1)}%)`).join('<br>'); const topP=countBy(pr).filter(x=>x.count).map(x=>`${x.combo} ${x.count}명(${x.rate.toFixed(1)}%)`).join('<br>'); return `<table><thead><tr><th style="width:100px">월</th><th>내원일 기준 조합</th><th>환자 기준 누적 조합</th></tr></thead><tbody><tr><td><b>${m}</b><br><small>${dr.length.toLocaleString()}건 / ${pr.length.toLocaleString()}명</small></td><td>${topD||'-'}</td><td>${topP||'-'}</td></tr></tbody></table>`}).join('')||'<div class="hint">월별 데이터가 없습니다.</div>';}
 function renderAll(){renderSummary(); comboTable(state.dateRows,'dateComboTable','date'); comboTable(state.patientRows,'patientComboTable','patient'); selectCombo('date',state.selectedDateCombo||'주사치료'); selectCombo('patient',state.selectedPatientCombo||'주사치료'); renderMonths();}
 function downloadCsv(rows,filename){if(!rows.length){alert('다운로드할 리스트가 없습니다.'); return;} const cols=Object.keys(rows[0]).filter(k=>!['dkey','pkey','dates','source'].includes(k)); const csv='\ufeff'+[cols.join(',')].concat(rows.map(r=>cols.map(c=>`"${norm(r[c]).replaceAll('"','""')}"`).join(','))).join('\n'); const a=document.createElement('a'); a.href=URL.createObjectURL(new Blob([csv],{type:'text/csv;charset=utf-8'})); a.download=filename; a.click();}
-analyzeBtn.onclick=()=>{if(!state.total.length){alert('총내원 파일을 먼저 업로드해주세요.'); return;} build();};
+analyzeBtn.onclick=()=>{if(!state.total.length){alert('총내원/내원 파일을 먼저 업로드해주세요.'); return;} build();};
 sampleBtn.onclick=()=>alert(`총내원 ${state.total.length}건\n주사 ${state.inj.length}건\n도수 ${state.manual.length}건\n충격파 ${state.shock.length}건`);
 resetBtn.onclick=()=>location.reload(); dateSearch.oninput=()=>listRows(state.dateRows.filter(r=>!state.selectedDateCombo||r.combo===state.selectedDateCombo),'dateList','date'); patientSearch.oninput=()=>listRows(state.patientRows.filter(r=>!state.selectedPatientCombo||r.combo===state.selectedPatientCombo),'patientList','patient'); sortMode.onchange=()=>renderAll(); dateCsv.onclick=()=>downloadCsv(state.lastDateList,'내원일기준_치료조합리스트.csv'); patientCsv.onclick=()=>downloadCsv(state.lastPatientList,'환자기준_치료조합리스트.csv');
 document.querySelectorAll('.tab').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tab').forEach(x=>x.classList.remove('active')); b.classList.add('active'); document.querySelectorAll('.tabpane').forEach(x=>x.classList.add('hidden')); document.getElementById(b.dataset.tab).classList.remove('hidden');});
